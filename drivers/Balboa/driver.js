@@ -1,6 +1,7 @@
 const Homey = require('homey');
 const ControlMySpa = require('../../lib/balboa/cms');
 const { encrypt } = require('../../lib/helpers');
+const BalboaLocal = require('../../lib/balboa/local');
 
 module.exports = class driver_Balboa extends Homey.Driver {
     onInit() {
@@ -9,6 +10,22 @@ module.exports = class driver_Balboa extends Homey.Driver {
     }
 
     async onPair(session) {
+        this.results = [];
+        this.mode = 'local';
+
+        session.setHandler('select_mode', async (data) => {
+            this.homey.app.log(`[Driver] ${this.id} - select_mode:`, data);
+            this.mode = data;
+            return true;
+        });
+
+        session.setHandler('manual_ip', async (ip) => {
+            this.homey.app.log(`[Driver] ${this.id} - manual_ip:`, ip);
+            this.mode = 'local';
+            this.manualIp = ip;
+            return true;
+        });
+
         session.setHandler('login', async (data) => {
             try {
                 this.config = {
@@ -35,28 +52,65 @@ module.exports = class driver_Balboa extends Homey.Driver {
 
         session.setHandler('list_devices', async () => {
             this.results = [];
-            this.homey.app.log(`[Driver] ${this.id} - this.balboaData`, this.balboaData);
 
-            if (Array.isArray(this.balboaData)) {
-                this.balboaData.forEach((device) => {
+            if (this.mode === 'local') {
+                this.homey.app.log(`[Driver] ${this.id} - Starting local discovery...`);
+                const localIps = await BalboaLocal.discover(5000);
+                this.homey.app.log(`[Driver] ${this.id} - Discovered local IPs:`, localIps);
+
+                if (localIps.length > 0) {
+                    localIps.forEach((ip) => {
+                        this.results.push({
+                            name: `Spa at ${ip}`,
+                            data: {
+                                id: `local-${ip.replace(/\./g, '-')}`,
+                                ip: ip,
+                                mode: 'local'
+                            },
+                            settings: {
+                                ip: ip,
+                                mode: 'local'
+                            }
+                        });
+                    });
+                } else if (this.manualIp) {
+                    this.homey.app.log(`[Driver] ${this.id} - Using manual IP:`, this.manualIp);
                     this.results.push({
-                        name: device.serialNumber, // Use the serialNumber from the object
+                        name: `Spa (Manual: ${this.manualIp})`,
                         data: {
-                            id: device._id // Use the _id from the object
+                            id: `local-${this.manualIp.replace(/\./g, '-')}`,
+                            ip: this.manualIp,
+                            mode: 'local'
                         },
                         settings: {
-                            ...this.config,
-                            username: this.config.username,
-                            password: encrypt(this.config.password)
+                            ip: this.manualIp,
+                            mode: 'local'
                         }
                     });
-                });
+                }
             } else {
-                this.homey.app.log(`[Driver] ${this.id} - balboaData is not an array.`);
+                // Cloud discovery
+                if (this.balboaData && Array.isArray(this.balboaData)) {
+                    this.homey.app.log(`[Driver] ${this.id} - Adding cloud devices...`);
+                    this.balboaData.forEach((device) => {
+                        this.results.push({
+                            name: device.serialNumber,
+                            data: {
+                                id: device._id,
+                                mode: 'cloud'
+                            },
+                            settings: {
+                                ...this.config,
+                                username: this.config.username,
+                                password: encrypt(this.config.password),
+                                mode: 'cloud'
+                            }
+                        });
+                    });
+                }
             }
 
             this.homey.app.log(`[Driver] ${this.id} - Found devices - `, this.results);
-
             return this.results;
         });
     }

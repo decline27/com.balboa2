@@ -1,5 +1,6 @@
 const Homey = require('homey');
 const ControlMySpa = require('../../lib/balboa/cms');
+const BalboaLocal = require('../../lib/balboa/local');
 const { sleep, decrypt, encrypt, toCelsius, toFahrenheit } = require('../../lib/helpers');
 const mockEnabled = false; // for debugging without API access
 
@@ -57,11 +58,38 @@ module.exports = class device_Balboa extends Homey.Device {
         const deviceData = this.getData();
 
         try {
-            this.config = { ...settings, ...deviceData, password: decrypt(settings.password) };
+            this.config = { ...settings, ...deviceData };
+            if (this.config.password) {
+                this.config.password = decrypt(this.config.password);
+            }
 
             this.homey.app.log(`[Device] - ${this.getName()} => setControlMySpaClient Got config`, { ...this.config, username: 'LOG', password: 'LOG' });
 
-            this._controlMySpaClient = await new ControlMySpa(this.config.username, this.config.password, this.config.id);
+            if (this.config.mode === 'local') {
+                this.homey.app.log(`[Device] - ${this.getName()} => Using LOCAL mode at ${this.config.ip}`);
+                this._controlMySpaClient = new BalboaLocal(this.config.ip);
+
+                // Polyfill some methods to match ControlMySpa interface
+                this._controlMySpaClient.getSpa = async () => {
+                    return this._controlMySpaClient.lastState;
+                };
+                this._controlMySpaClient.deviceInit = async () => {
+                    this._controlMySpaClient.connect();
+                    return true;
+                };
+
+                this._controlMySpaClient.on('error', (err) => {
+                    this.homey.app.error(`[Device] ${this.getName()} - Local Client Error:`, err);
+                });
+
+                this._controlMySpaClient.on('status', (state) => {
+                    this.setCapabilityValues();
+                });
+
+            } else {
+                this.homey.app.log(`[Device] - ${this.getName()} => Using CLOUD mode`);
+                this._controlMySpaClient = await new ControlMySpa(this.config.username, this.config.password, this.config.id);
+            }
 
             await this._controlMySpaClient.deviceInit();
 

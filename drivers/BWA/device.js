@@ -11,11 +11,13 @@ const {
     updateHeatMode
 } = require('../../lib/balboa/bwa');
 const { sleep, decrypt, encrypt, toCelsius, toFahrenheit } = require('../../lib/helpers');
+const BalboaLocal = require('../../lib/balboa/local');
 
 module.exports = class device_BWA extends Homey.Device {
     async onInit() {
         try {
             this.homey.app.log('[Device] - init =>', this.getName());
+            this._locks = {};
             this.setUnavailable(`Connecting to ${this.getName()}`);
 
             await this.checkCapabilities();
@@ -63,23 +65,54 @@ module.exports = class device_BWA extends Homey.Device {
     // ------------- API -------------
     async setBwaClient(overrideSettings = null) {
         const settings = overrideSettings ? overrideSettings : this.getSettings();
-        const deviceObject = this.getData();
+        const deviceData = this.getData();
 
         try {
-            this.config = { ...settings, password: decrypt(settings.password) };
+            this.config = { ...settings };
+            if (this.config.password) {
+                this.config.password = decrypt(this.config.password);
+            }
 
             this.homey.app.log(`[Device] - ${this.getName()} => setBwaClient Got config`, { ...this.config, username: 'LOG', password: 'LOG' });
 
-            this._BwaClient = await loginAndGetToken(this.config.username, this.config.password);
+            if (this.config.mode === 'local') {
+                this.homey.app.log(`[Device] - ${this.getName()} => Using LOCAL mode at ${this.config.ip}`);
+                this._BwaClient = new BalboaLocal(this.config.ip);
 
-            const components = await handleDeviceConfigurationRequest(deviceObject.id);
+                // Polyfill for BWA interface
+                this._BwaClient.getSpa = async () => {
+                    // Adapt local state to BWA format if needed, but setCapabilityValues handles it
+                    return this._BwaClient.lastState;
+                };
 
-            if (Object.keys(components).length) {
-                await this.setCapabilityValues(null, true);
+                this._BwaClient.on('status', (state) => {
+                    this.setCapabilityValues();
+                });
+
+                this._BwaClient.on('config', (config) => {
+                    this.homey.app.log(`[Device] ${this.getName()} - Received local config:`, config);
+                    this.setCapabilityValues(null, true);
+                });
+
+                this._BwaClient.on('error', (err) => {
+                    this.homey.app.error(`[Device] ${this.getName()} - Local Client Error:`, err);
+                });
+
+                this._BwaClient.connect();
                 await this.setAvailable();
                 await this.setIntervalsAndFlows(settings);
             } else {
-                this.setUnavailable(`Something went wrong with connecting to ${this.getName()}`);
+                this.homey.app.log(`[Device] - ${this.getName()} => Using CLOUD mode`);
+                this._BwaClient = await loginAndGetToken(this.config.username, this.config.password);
+                const components = await handleDeviceConfigurationRequest(deviceData.id);
+
+                if (Object.keys(components).length) {
+                    await this.setCapabilityValues(null, true);
+                    await this.setAvailable();
+                    await this.setIntervalsAndFlows(settings);
+                } else {
+                    this.setUnavailable(`Something went wrong with connecting to ${this.getName()}`);
+                }
             }
         } catch (error) {
             this.homey.app.log(`[Device] ${this.getName()} - setBwaClient - error =>`, error);
@@ -111,9 +144,20 @@ module.exports = class device_BWA extends Homey.Device {
     async onCapability_TEMPERATURE(value) {
         try {
             const deviceObject = this.getData();
-            this.homey.app.log(`[Device] ${this.getName()} - onCapability_TEMPERATURE ${value}C ${toFahrenheit(value)}F`);
+            this.homey.app.log(`[Device] ${this.getName()} - onCapability_TEMPERATURE ${value}C`);
 
-            await updateTemperature(deviceObject.id, value);
+            // Lock temperature for 10 seconds (local spas can be slow to update status)
+            if (!this._locks) this._locks = {};
+            this._locks['target_temperature'] = {
+                value: value,
+                expiry: Date.now() + 10000
+            };
+
+            if (this.config.mode === 'local') {
+                await this._BwaClient.setTemp(value);
+            } else {
+                await updateTemperature(deviceObject.id, value);
+            }
 
             return Promise.resolve(true);
         } catch (e) {
@@ -126,10 +170,14 @@ module.exports = class device_BWA extends Homey.Device {
         try {
             this.homey.app.log(`[Device] ${this.getName()} - onCapability_LOCKED`, value);
 
-            if (value) {
-                await this._controlMySpaClient.lockPanel();
+            if (this.config.mode === 'local') {
+                await this._BwaClient.setPanelLock(value);
             } else {
-                await this._controlMySpaClient.unlockPanel();
+                if (value) {
+                    await this._BwaClient.lockPanel();
+                } else {
+                    await this._BwaClient.unlockPanel();
+                }
             }
 
             return Promise.resolve(true);
@@ -144,59 +192,83 @@ module.exports = class device_BWA extends Homey.Device {
             const deviceObject = this.getData();
             this.homey.app.log(`[Device] ${this.getName()} - onCapability_ACTION`, value);
 
-            if ('action_blower_state' in value) {
-                await updateBlowerStatus(deviceObject.id, value.action_blower_state);
-            }
+            // Lock capabilities for 5 seconds to prevent UI reverts from stale status packets
+            if (!this._locks) this._locks = {};
+            Object.keys(value).forEach(cap => {
+                this._locks[cap] = {
+                    value: value[cap],
+                    expiry: Date.now() + 5000
+                };
+            });
 
-            if ('action_light_state' in value) {
-                await updateLightStatus(deviceObject.id, 1, value.action_light_state);
-            }
+            if (this.config.mode === 'local') {
+                if ('action_blower_state' in value) await this._BwaClient.setBlowerState(0, value.action_blower_state);
+                if ('action_light_state' in value) await this._BwaClient.setLightState(0, value.action_light_state);
+                if ('action_pump_state' in value) await this._BwaClient.setJetState(0, value.action_pump_state);
+                if ('action_pump_state.1' in value) await this._BwaClient.setJetState(1, value['action_pump_state.1']);
+                if ('action_pump_state.2' in value) await this._BwaClient.setJetState(2, value['action_pump_state.2']);
+                if ('action_pump_state.3' in value) await this._BwaClient.setJetState(3, value['action_pump_state.3']);
+                if ('action_pump_state.4' in value) await this._BwaClient.setJetState(4, value['action_pump_state.4']);
+                if ('action_pump_state.5' in value) await this._BwaClient.setJetState(5, value['action_pump_state.5']);
+                if ('action_heater_mode' in value) await this._BwaClient.setHeaterMode(value.action_heater_mode ? 'READY' : 'REST');
+                if ('action_temp_range' in value) await this._BwaClient.setTempRange(value.action_temp_range);
+            } else {
+                if ('action_blower_state' in value) {
+                    await updateBlowerStatus(deviceObject.id, value.action_blower_state);
+                }
 
-            if ('action_pump_state' in value) {
-                await updatePumpStatus(deviceObject.id, 1, value['action_pump_state']);
-            }
+                if ('action_light_state' in value) {
+                    await updateLightStatus(deviceObject.id, 1, value.action_light_state);
+                }
 
-            if ('action_pump_state.1' in value) {
-                await updatePumpStatus(deviceObject.id, 2, value['action_pump_state.1']);
-            }
+                if ('action_pump_state' in value) {
+                    await updatePumpStatus(deviceObject.id, 1, value['action_pump_state']);
+                }
 
-            if ('action_pump_state.2' in value) {
-                await updatePumpStatus(deviceObject.id, 3, value['action_pump_state.2']);
-            }
+                if ('action_pump_state.1' in value) {
+                    await updatePumpStatus(deviceObject.id, 2, value['action_pump_state.1']);
+                }
 
-            if ('action_pump_state.3' in value) {
-                await updatePumpStatus(deviceObject.id, 4, value['action_pump_state.3']);
-            }
+                if ('action_pump_state.2' in value) {
+                    await updatePumpStatus(deviceObject.id, 3, value['action_pump_state.2']);
+                }
 
-            if ('action_pump_state.4' in value) {
-                await updatePumpStatus(deviceObject.id, 5, value['action_pump_state.4']);
-            }
+                if ('action_pump_state.3' in value) {
+                    await updatePumpStatus(deviceObject.id, 4, value['action_pump_state.3']);
+                }
 
-            if ('action_pump_state.5' in value) {
-                await updatePumpStatus(deviceObject.id, 6, value['action_pump_state.5']);
-            }
+                if ('action_pump_state.4' in value) {
+                    await updatePumpStatus(deviceObject.id, 5, value['action_pump_state.4']);
+                }
 
-            if ('action_heater_mode' in value) {
-                updateHeatMode(deviceObject.id, value.action_heater_mode);
-            }
+                if ('action_pump_state.5' in value) {
+                    await updatePumpStatus(deviceObject.id, 6, value['action_pump_state.5']);
+                }
 
-            if ('action_temp_range' in value) {
-                updateTemperatureRange(deviceObject.id, !!parseInt(value.action_temp_range));
+                if ('action_heater_mode' in value) {
+                    updateHeatMode(deviceObject.id, value.action_heater_mode);
+                }
 
-                if (!!parseInt(value.action_temp_range)) {
-                    this.setCapabilityOptions('target_temperature', {
-                        min: toCelsius(80),
-                        max: toCelsius(104)
-                    });
-                } else {
-                    this.setCapabilityOptions('target_temperature', {
-                        min: toCelsius(50),
-                        max: toCelsius(99)
-                    });
+                if ('action_temp_range' in value) {
+                    updateTemperatureRange(deviceObject.id, !!parseInt(value.action_temp_range));
+
+                    if (!!parseInt(value.action_temp_range)) {
+                        this.setCapabilityOptions('target_temperature', {
+                            min: toCelsius(80),
+                            max: toCelsius(104)
+                        });
+                    } else {
+                        this.setCapabilityOptions('target_temperature', {
+                            min: toCelsius(50),
+                            max: toCelsius(99)
+                        });
+                    }
                 }
             }
 
-            await this.setCapabilityValues();
+            // Wait a small amount for the spa to process the command before next poll
+            // No longer calling setCapabilityValues() immediately to prevent race conditions with stale status packets
+            await sleep(1000);
 
             return Promise.resolve(true);
         } catch (e) {
@@ -223,30 +295,100 @@ module.exports = class device_BWA extends Homey.Device {
     }
 
     async setCapabilityValues(deviceInfoOverride = null, check = false) {
-        this.homey.app.log(`[Device] ${this.getName()} - setCapabilityValues`);
+        // this.homey.app.log(`[Device] ${this.getName()} - setCapabilityValues`);
 
         try {
             const deviceObject = this.getData();
             const settings = this.getSettings();
-            let deviceInfo = deviceInfoOverride ? deviceInfoOverride : await handlePanelUpdateRequest(deviceObject.id);
+
+            let deviceInfo;
+            if (this.config.mode === 'local') {
+                const localState = this._BwaClient.lastState;
+                // Only skip status updates, not capability checks (which use lastConfig)
+                if (!localState && !check) return;
+
+                if (localState) {
+                    // Map local state to BWA format
+                    const pump1 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '0');
+                    const pump2 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '1');
+                    const pump3 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '2');
+                    const pump4 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '3');
+                    const pump5 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '4');
+                    const pump6 = localState.components.find(c => c.componentType === 'PUMP' && c.port === '5');
+                    const blower = localState.components.find(c => c.componentType === 'BLOWER');
+                    const heater = localState.components.find(c => c.componentType === 'HEATER');
+
+                    deviceInfo = {
+                        actualTemperature: localState.currentTemp,
+                        targetTemperature: localState.desiredTemp,
+                        pumpsState: {
+                            Pump1: pump1 ? (pump1.value === 'OFF' ? 'off' : 'on') : 'off',
+                            Pump2: pump2 ? (pump2.value === 'OFF' ? 'off' : 'on') : 'off',
+                            Pump3: pump3 ? (pump3.value === 'OFF' ? 'off' : 'on') : 'off',
+                            Pump4: pump4 ? (pump4.value === 'OFF' ? 'off' : 'on') : 'off',
+                            Pump5: pump5 ? (pump5.value === 'OFF' ? 'off' : 'on') : 'off',
+                            Pump6: pump6 ? (pump6.value === 'OFF' ? 'off' : 'on') : 'off',
+                        },
+                        lightsState: {
+                            Light1: localState.components.find(c => c.componentType === 'LIGHT' && c.port === '0')?.value === 'OFF' ? 'off' : 'on'
+                        },
+                        blowerState: blower ? (blower.value === 'OFF' ? 'off' : 'on') : 'off',
+                        temperatureRange: localState.tempRange.toLowerCase(),
+                        heatMode: localState.heaterMode,
+                        isHeating: heater ? heater.value === 'ON' : false,
+                        wifiState: localState.online ? 'WiFi OK' : 'Offline'
+                    };
+                }
+            } else {
+                deviceInfo = deviceInfoOverride ? deviceInfoOverride : await handlePanelUpdateRequest(deviceObject.id);
+            }
+
+            // Handle capability addition (check mode)
+            if (check) {
+                let components = {};
+                if (this.config.mode === 'local') {
+                    const localConfig = this._BwaClient.lastConfig;
+
+                    if (localConfig) {
+                        components = {
+                            Pumps: {
+                                Pump1: { present: localConfig.pumps.Pump1 },
+                                Pump2: { present: localConfig.pumps.Pump2 },
+                                Pump3: { present: localConfig.pumps.Pump3 },
+                                Pump4: { present: localConfig.pumps.Pump4 },
+                                Pump5: { present: localConfig.pumps.Pump5 },
+                                Pump6: { present: localConfig.pumps.Pump6 }
+                            },
+                            Blower: { present: localConfig.blower },
+                            Lights: { Light1: { present: localConfig.lights.Light1 } }
+                        };
+
+                    }
+                } else {
+                    components = await handleDeviceConfigurationRequest(deviceObject.id);
+                }
+
+                if (components && components.Pumps) {
+                    const { Pumps: pumps } = components;
+
+                    if (pumps.Pump1 && pumps.Pump1.present) await this.addCapability('action_pump_state');
+                    if (pumps.Pump2 && pumps.Pump2.present) await this.addCapability('action_pump_state.1');
+                    if (pumps.Pump3 && pumps.Pump3.present) await this.addCapability('action_pump_state.2');
+                    if (pumps.Pump4 && pumps.Pump4.present) await this.addCapability('action_pump_state.3');
+                    if (pumps.Pump5 && pumps.Pump5.present) await this.addCapability('action_pump_state.4');
+                    if (pumps.Pump6 && pumps.Pump6.present) await this.addCapability('action_pump_state.5');
+                    if (components.Blower && components.Blower.present) await this.addCapability('action_blower_state');
+                }
+            }
+
+            // If no deviceInfo (only ran check mode), return early
+            if (!deviceInfo) return;
 
             const { actualTemperature, targetTemperature, pumpsState, lightsState, blowerState, temperatureRange, heatMode, isHeating, wifiState } = deviceInfo;
 
-            this.homey.app.log(`[Device] ${this.getName()} - deviceInfo =>`, deviceInfo);
+            // this.homey.app.log(`[Device] ${this.getName()} - deviceInfo =>`, deviceInfo);
 
             if (check) {
-                const components = await handleDeviceConfigurationRequest(deviceObject.id);
-
-                const { Pumps: pumps } = components;
-
-                if (pumps.Pump1.present) await this.addCapability('action_pump_state');
-                if (pumps.Pump2.present) await this.addCapability('action_pump_state.1');
-                if (pumps.Pump3.present) await this.addCapability('action_pump_state.2');
-                if (pumps.Pump4.present) await this.addCapability('action_pump_state.3');
-                if (pumps.Pump5.present) await this.addCapability('action_pump_state.4');
-                if (pumps.Pump6.present) await this.addCapability('action_pump_state.5');
-                if (components.Blower.present) await this.addCapability('action_blower_state');
-
                 if (temperatureRange === 'high') {
                     this.setCapabilityOptions('target_temperature', {
                         min: toCelsius(80),
@@ -321,14 +463,31 @@ module.exports = class device_BWA extends Homey.Device {
     }
 
     async setValue(key, value, firstRun = false, delay = 10, roundNumber = false) {
-        this.homey.app.log(`[Device] ${this.getName()} - setValue => ${key} => `, value);
-
         if (this.hasCapability(key)) {
+            // Check if capability is locked
+            if (this._locks && this._locks[key]) {
+                const lock = this._locks[key];
+                if (Date.now() < lock.expiry) {
+                    const isDifferent = typeof lock.value === 'number' ? Math.abs(lock.value - value) > 0.1 : lock.value !== value;
+                    if (isDifferent) {
+                        this.homey.app.log(`[Device] ${this.getName()} - Ignoring revert for ${key} (locked to ${lock.value}, got ${value})`);
+                        return;
+                    } else {
+                        // Value matches, we can unlock early
+                        delete this._locks[key];
+                    }
+                } else {
+                    delete this._locks[key];
+                }
+            }
+
             const newKey = key.replace('.', '_');
-            const oldVal = await this.getCapabilityValue(key);
+            const oldVal = this.getCapabilityValue(key);
             const newVal = roundNumber ? Math.round(value) : value;
 
-            this.homey.app.log(`[Device] ${this.getName()} - setValue - oldValue => ${key} => `, oldVal, newVal);
+            if (oldVal === newVal) return;
+
+            this.homey.app.log(`[Device] ${this.getName()} - setValue => ${key} => `, newVal, `(was ${oldVal})`);
 
             if (delay) {
                 await sleep(delay);
