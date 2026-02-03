@@ -561,7 +561,11 @@ module.exports = class device_BWA extends Homey.Device {
     async updateCapabilities(driverCapabilities, deviceCapabilities) {
         try {
             const newC = driverCapabilities.filter((d) => !deviceCapabilities.includes(d));
-            const oldC = deviceCapabilities.filter((d) => !driverCapabilities.includes(d));
+            // Exclude dynamic capabilities (pumps, blowers) from removal - they're added based on spa config
+            const dynamicCapabilities = ['action_pump_state', 'action_pump_state.1', 'action_pump_state.2',
+                'action_pump_state.3', 'action_pump_state.4', 'action_pump_state.5',
+                'action_blower_state', 'action_blower_state.1'];
+            const oldC = deviceCapabilities.filter((d) => !driverCapabilities.includes(d) && !dynamicCapabilities.includes(d));
 
             this.homey.app.log(`[Device] ${this.getName()} - Got old capabilities =>`, oldC);
             this.homey.app.log(`[Device] ${this.getName()} - Got new capabilities =>`, newC);
