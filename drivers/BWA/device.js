@@ -98,7 +98,25 @@ module.exports = class device_BWA extends Homey.Device {
                     this.homey.app.error(`[Device] ${this.getName()} - Local Client Error:`, err);
                 });
 
+                this._BwaClient.on('commandFailed', (info) => {
+                    this.homey.app.error(`[Device] ${this.getName()} - COMMAND FAILED: ${info.description}`);
+                });
+
+                this._BwaClient.on('ipChanged', async ({ oldIp, newIp }) => {
+                    this.homey.app.log(`[Device] ${this.getName()} - 🔄 Spa IP changed: ${oldIp} → ${newIp}`);
+                    try {
+                        // Persist the new IP to device settings so it survives restarts
+                        this.config.ip = newIp;
+                        await this.setSettings({ ip: newIp });
+                        this.homey.app.log(`[Device] ${this.getName()} - New IP saved to settings`);
+                    } catch (err) {
+                        this.homey.app.error(`[Device] ${this.getName()} - Failed to save new IP:`, err);
+                    }
+                });
+
                 this._BwaClient.connect();
+                // Start periodic polling so we always have fresh state for commands and UI
+                this._BwaClient.startPolling(300000); // Every 5 minutes
                 await this.setAvailable();
                 await this.setIntervalsAndFlows(settings);
             } else {
@@ -281,6 +299,11 @@ module.exports = class device_BWA extends Homey.Device {
         try {
             this.homey.app.log(`[Device] ${this.getName()} - onCapability_UPDATE_DATA`, value);
 
+            // Actually fetch fresh state from the spa (not just re-render cached state)
+            if (this._BwaClient && this._BwaClient.ensureState) {
+                await this._BwaClient.ensureState();
+            }
+
             await this.setCapabilityValues();
 
             await this.setCapabilityValue('action_update_data', false);
@@ -453,8 +476,15 @@ module.exports = class device_BWA extends Homey.Device {
             await this.setValue('target_temperature', targetTemperature, check, 10, settings.round_temp);
 
             if (actualTemperature === 127.5) {
-                await this.setValue('measure_temperature', 38, check, 10, settings.round_temp);
+                // Spa is in sleep mode — temperature sensor is off (raw 0xFF = 127.5°C).
+                // Skip update so Homey keeps showing the last real temperature reading.
+                // Only log once to avoid spamming the log on every poll.
+                if (!this._sleepModeTempLogged) {
+                    this._sleepModeTempLogged = true;
+                    this.homey.app.log(`[Device] ${this.getName()} - Temperature unavailable (spa in sleep mode), keeping last known value`);
+                }
             } else {
+                this._sleepModeTempLogged = false; // Reset flag when real temp is available again
                 await this.setValue('measure_temperature', actualTemperature, check, 10, settings.round_temp);
             }
         } catch (error) {
@@ -587,5 +617,11 @@ module.exports = class device_BWA extends Homey.Device {
 
     onDeleted() {
         this.clearIntervals();
+        if (this._BwaClient && this._BwaClient.stopPolling) {
+            this._BwaClient.stopPolling();
+        }
+        if (this._BwaClient && this._BwaClient.disconnect) {
+            this._BwaClient.disconnect();
+        }
     }
 };
