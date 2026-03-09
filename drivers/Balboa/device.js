@@ -126,9 +126,15 @@ module.exports = class device_Balboa extends Homey.Device {
         try {
             this.homey.app.log(`[Device] ${this.getName()} - onCapability_TEMPERATURE ${value}C ${toFahrenheit(value)}F`);
 
-            // Send requested temperature to the spa in Fahrenheit + 0.4 degrees.
-            // This is how the Balboa ControlMySpa mobile app does it.
-            const data = await this._controlMySpaClient.setTemp(toFahrenheit(value) + 0.4);
+            // Send requested temperature to the spa.
+            // Local mode uses Celsius directly.
+            let data;
+            if (this.config.mode === 'local') {
+                data = await this._controlMySpaClient.setTemp(value);
+            } else {
+                // Cloud mode uses Fahrenheit + 0.4 offset
+                data = await this._controlMySpaClient.setTemp(toFahrenheit(value) + 0.4);
+            }
 
             return Promise.resolve(true);
         } catch (e) {
@@ -201,7 +207,9 @@ module.exports = class device_Balboa extends Homey.Device {
             }
 
             if ('action_temp_range' in value) {
-                data = await this._controlMySpaClient.setTempRange(value.action_temp_range);
+                const isHighRange = value.action_temp_range === true || value.action_temp_range === 'HIGH' || value.action_temp_range === 'high';
+                this._intendedRange = isHighRange ? 'HIGH' : 'LOW';
+                data = await this._controlMySpaClient.setTempRange(isHighRange);
             }
 
             if ('filter' in value && 'interval' in value) {
@@ -271,20 +279,39 @@ module.exports = class device_Balboa extends Homey.Device {
 
             // ------------ Get values --------------
             const light = await this.getComponentValue('LIGHT', components);
-            const tempRangeHigh = tempRange === 'HIGH';
-            const tempRangeLow = tempRange === 'LOW';
-            const heaterReady = heaterMode === 'READY';
+            const tempRangeHigh = (this._intendedRange || tempRange).toUpperCase() === 'HIGH';
+            const tempRangeLow = (this._intendedRange || tempRange).toUpperCase() === 'LOW';
+            
+            if (tempRange.toUpperCase() === (this._intendedRange || '').toUpperCase()) {
+                this._intendedRange = null;
+            }
 
             if (tempRangeHigh) {
                 await this.setCapabilityOptions('target_temperature', {
-                    min: toCelsius(setupParams.highRangeLow),
-                    max: toCelsius(setupParams.highRangeHigh)
+                    min: setupParams.highRangeLow,
+                    max: setupParams.highRangeHigh,
+                    step: 0.5
                 });
             } else if (tempRangeLow) {
                 await this.setCapabilityOptions('target_temperature', {
-                    min: toCelsius(setupParams.lowRangeLow),
-                    max: toCelsius(setupParams.lowRangeHigh)
+                    min: setupParams.lowRangeLow,
+                    max: setupParams.lowRangeHigh,
+                    step: 0.5
                 });
+            }
+
+            // Forced UI refresh logic
+            const currentTarget = this.getCapabilityValue('target_temperature');
+            if (currentTarget !== null && setupParams) {
+                const min = tempRangeHigh ? setupParams.highRangeLow : setupParams.lowRangeLow;
+                const max = tempRangeHigh ? setupParams.highRangeHigh : setupParams.lowRangeHigh;
+                
+                // Only update if limits actually changed to avoid UI glitching
+                if (!this._currentLimits || this._currentLimits.min !== min || this._currentLimits.max !== max) {
+                    this._currentLimits = { min, max };
+                    const snappedTarget = Math.min(max, Math.max(min, Number(currentTarget)));
+                    await this.setCapabilityValue('target_temperature', snappedTarget);
+                }
             }
 
             if (pump0) {
@@ -327,12 +354,12 @@ module.exports = class device_Balboa extends Homey.Device {
             await this.setValue('locked', panelLock, check);
             await this.setValue('action_light_state', light, check);
             await this.setValue('action_heater_mode', heaterReady, check);
-            await this.setValue('action_temp_range', tempRangeHigh, check);
+            await this.setValue('action_temp_range', tempRange.toUpperCase() === 'HIGH', check);
             await this.setValue('measure_temperature_range', tempRange, check);
             await this.setValue('measure_heater_mode', heaterMode, check);
             await this.setValue('measure_online', online, check);
 
-            if (currentTemp) await this.setValue('measure_temperature', toCelsius(currentTemp), check, 10, settings.round_temp);
+            if (currentTemp) await this.setValue('measure_temperature', currentTemp, check, 10, settings.round_temp);
 
             // If desiredTemp is available, compare it to targetDesiredTemp. There should be 0.4 difference for valid value.
             // Use also desiredTemp when targetDesiredTemp is at highRangeHigh or lowRangeLow, when tempRange was changed.
@@ -344,9 +371,9 @@ module.exports = class device_Balboa extends Homey.Device {
             if (typeof desiredTemp !== 'undefined') desiredTemp = Number(desiredTemp.toString().replace(',', '.'));
 
             if (desiredTemp && (targetDesiredTemp === desiredTemp + 0.4 || targetDesiredTemp === setupParams.highRangeHigh || targetDesiredTemp == setupParams.lowRangeLow)) {
-                await this.setValue('target_temperature', toCelsius(desiredTemp), check, 10, settings.round_temp);
+                await this.setValue('target_temperature', desiredTemp, check, 10, settings.round_temp);
             } else {
-                await this.setValue('target_temperature', toCelsius(targetDesiredTemp - 0.4), check, 10, settings.round_temp);
+                await this.setValue('target_temperature', targetDesiredTemp, check, 10, settings.round_temp);
             }
 
             // Set Spa clock if spa is online and clock_sync is enabled.

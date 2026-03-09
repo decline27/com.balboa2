@@ -268,19 +268,14 @@ module.exports = class device_BWA extends Homey.Device {
                 }
 
                 if ('action_temp_range' in value) {
-                    updateTemperatureRange(deviceObject.id, !!parseInt(value.action_temp_range));
-
-                    if (!!parseInt(value.action_temp_range)) {
-                        this.setCapabilityOptions('target_temperature', {
-                            min: toCelsius(80),
-                            max: toCelsius(104)
-                        });
-                    } else {
-                        this.setCapabilityOptions('target_temperature', {
-                            min: toCelsius(50),
-                            max: toCelsius(99)
-                        });
-                    }
+                    const isHighRange = value.action_temp_range === true || value.action_temp_range === 'HIGH' || value.action_temp_range === 'high';
+                    const targetRange = isHighRange ? 'HIGH' : 'LOW';
+                    
+                    // Lock the intended range to prevent polling from reverting UI limits
+                    this._intendedRange = targetRange;
+                    
+                    await this._BwaClient.setTempRange(isHighRange);
+                    await this._updateTargetTempLimits(targetRange);
                 }
             }
 
@@ -411,19 +406,7 @@ module.exports = class device_BWA extends Homey.Device {
 
             // this.homey.app.log(`[Device] ${this.getName()} - deviceInfo =>`, deviceInfo);
 
-            if (check) {
-                if (temperatureRange === 'high') {
-                    this.setCapabilityOptions('target_temperature', {
-                        min: toCelsius(80),
-                        max: toCelsius(104)
-                    });
-                } else {
-                    this.setCapabilityOptions('target_temperature', {
-                        min: toCelsius(50),
-                        max: toCelsius(99)
-                    });
-                }
-            }
+            await this._updateTargetTempLimits();
 
             // ------------ Get values --------------
             const light = lightsState.Light1 === 'on';
@@ -468,7 +451,7 @@ module.exports = class device_BWA extends Homey.Device {
             await this.setValue('action_update_data', false, check);
             await this.setValue('action_light_state', light, check);
             await this.setValue('action_heater_mode', heaterReady, check);
-            await this.setValue('action_temp_range', temperatureRange === 'high', check);
+            await this.setValue('action_temp_range', temperatureRange.toLowerCase() === 'high', check);
 
             await this.setValue('measure_heater_mode', heatMode.toUpperCase(), check);
             await this.setValue('measure_online', wifiState === 'WiFi OK', check);
@@ -622,6 +605,51 @@ module.exports = class device_BWA extends Homey.Device {
         }
         if (this._BwaClient && this._BwaClient.disconnect) {
             this._BwaClient.disconnect();
+        }
+    }
+    async _updateTargetTempLimits(forcedRange = null) {
+        if (!this._BwaClient || !this._BwaClient.lastState) return;
+
+        const { setupParams, tempRange: stateRange } = this._BwaClient.lastState;
+        if (!setupParams) return;
+
+        // Prioritize: 1. Forced range argument, 2. Intended range (from user click), 3. Current reported state
+        const tempRange = forcedRange || this._intendedRange || stateRange;
+        
+        // If state matches intended range, we can clear the lock
+        if (stateRange.toUpperCase() === (this._intendedRange || '').toUpperCase()) {
+            this._intendedRange = null;
+        }
+
+        const isHigh = tempRange.toUpperCase() === 'HIGH';
+        const min = isHigh ? setupParams.highRangeLow : setupParams.lowRangeLow;
+        const max = isHigh ? setupParams.highRangeHigh : setupParams.lowRangeHigh;
+
+        // Only update if limits have actually changed to avoid UI flickering/glitching
+        if (this._currentLimits && this._currentLimits.min === min && this._currentLimits.max === max) {
+            return;
+        }
+
+        this.homey.app.log(`[Device] ${this.getName()} - Updating target_temperature limits: min=${min}, max=${max} (range=${tempRange})`);
+
+        try {
+            this._currentLimits = { min, max };
+            await this.setCapabilityOptions('target_temperature', {
+                min: min,
+                max: max,
+                step: 0.5
+            });
+
+            // Force UI refresh by re-asserting the current target temperature.
+            // This makes the Homey app slider snap to the new min/max bounds.
+            const currentTarget = this.getCapabilityValue('target_temperature');
+            if (currentTarget !== null) {
+                const snappedTarget = Math.min(max, Math.max(min, Number(currentTarget)));
+                await this.setCapabilityValue('target_temperature', snappedTarget);
+            }
+        } catch (err) {
+            this.homey.app.error(`[Device] ${this.getName()} - Failed to update target_temperature options: ${err.message}`);
+            this._currentLimits = null; // Reset on error
         }
     }
 };
